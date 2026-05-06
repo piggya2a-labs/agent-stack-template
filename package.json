@@ -1,0 +1,26 @@
+{
+  "name": "agent-stack-template",
+  "version": "1.0.0",
+  "description": "LangGraph + Trigger.dev + Supabase agent infrastructure template",
+  "private": true,
+  "scripts": {
+    "dev": "trigger dev",
+    "deploy": "trigger deploy"
+  },
+  "dependencies": {
+    "@trigger.dev/sdk": "4.4.5"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "4.4.5",
+    "trigger.dev": "^4.4.5",
+    "typescript": "^5.4.5"
+  },
+  "pnpm": {
+    "overrides": {
+      "@opentelemetry/resources": "^2.0.1",
+      "@opentelemetry/sdk-trace-base": "^2.0.1",
+      "@opentelemetry/sdk-logs": "^0.57.0",
+      "@opentelemetry/sdk-metrics": "^2.0.1"
+    }
+  }
+}
