@@ -1,302 +1,395 @@
 /**
- * src/trigger/a2a-dispatch-sync.ts
+ * a2a-dispatch-sync · Synchronous A2A dispatch task.
  *
- * Synchronous Agent-to-Agent (A2A) dispatch.
- * Maximum task duration: 10 minutes (600 s).
+ * Called by `run_assistant()` Python tool when one agent wants to dispatch
+ * another and wait for the final response. Gives the target agent its own
+ * independent LangGraph thread (honoring the "every assistant = independent
+ * thread" architectural contract), avoids PR #386 single-thread deadlock,
+ * and bypasses all RemoteGraph bugs (peer-closed-connection, interrupt-resume,
+ * recursion loops, orphan spans).
  *
- * Flow:
- *   1. Resolve target assistant UUID by name/prompt_name via LangGraph API
- *   2. Create a new LangGraph thread (each A2A call gets its own thread)
- *   3. Stream the run, collecting the final response
- *   4. Write a dispatch audit entry to agent_memory (if tenant_id available)
- *   5. Return structured result to caller
+ * Design:
+ *   - Short/common path: create thread → POST /runs + /runs/{id}/join → return (sync, run_id retained)
+ *   - Long-task heuristic: if caller hints at a tool class known to run long
+ *     (E2B script / repo crawl / deep research), auto-downgrade to the async
+ *     dispatch task and return a pointer instead of blocking.
+ *   - Always writes a single `agent_memory(memory_type='dispatch')` audit row
+ *     linking caller_run_id / target_run_id / trigger_run_id / correlation_id.
  *
- * Called by: Lumen / Sega / any agent via `run_assistant` tool
- * Payload injected by: a2a_dispatch_sync Trigger.dev orchestration task
+ * Required env vars:
+ *   LANGGRAPH_URL             — your LangGraph Cloud deployment URL
+ *   LANGSMITH_API_KEY         — LangSmith API key
+ *   SUPABASE_URL              — your Supabase project URL
+ *   SUPABASE_SERVICE_ROLE_KEY — Supabase service role key
  */
+import { task, tasks, tags } from "@trigger.dev/sdk";
+import { appendDispatch } from "./streams";
 
-import { task, logger } from "@trigger.dev/sdk";
-
-// ── env helper ────────────────────────────────────────────────────────────────
-
-function env(name: string): string {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing required environment variable: ${name}`);
-  return val;
+function env(name: string, fallback = ""): string {
+  const v = process.env[name];
+  return v && v.length ? v : fallback;
 }
 
-// ── LangGraph helpers ─────────────────────────────────────────────────────────
+// Tools known to run long — trigger auto-downgrade to async dispatch.
+// Keep this set small & explicit; heuristics creep into bug magnets.
+const LONG_TASK_TOOLS = new Set<string>([
+  "e2b_run",
+  "e2b_script",
+  "repo_crawl",
+  "deep_research",
+  "claude_code_session",
+]);
 
-async function lgFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const base = env("LANGGRAPH_URL").replace(/\/$/, "");
-  return fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      "x-api-key": env("LANGSMITH_API_KEY"),
-      "Content-Type": "application/json",
-      ...(init.headers as Record<string, string> | undefined),
-    },
-  });
+export interface A2ADispatchPayload {
+  target_agent: string; // assistant name or configurable.prompt_name
+  assistant_id?: string; // optional explicit UUID; if absent resolved from target_agent
+  message: string;
+  // Provenance & linking
+  caller_assistant_id?: string;
+  caller_run_id?: string; // LangSmith run_id of caller's run
+  caller_thread_id?: string; // LangSmith thread_id of caller's thread
+  correlation_id: string;
+  tenant_id?: string;
+  intent_token?: string;
+  // Optional hint — allows caller to force async path for known long tools
+  hint_tool_type?: string;
+  actor_type?: string;
 }
 
-async function resolveAssistantId(agentName: string): Promise<string | null> {
-  // agentName may already be a UUID — if so, return directly
-  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (uuidPattern.test(agentName)) return agentName;
+export interface A2ADispatchSyncResult {
+  ok: boolean;
+  agent: string;
+  assistant_id: string;
+  thread_id?: string;
+  run_id?: string;
+  response?: string;
+  transport: "trigger_sync" | "trigger_async_downgrade";
+  async_run_id?: string;
+  memory_id?: string;
+  error?: string;
+}
 
-  // Search assistants by name
-  const res = await lgFetch(
-    `/assistants/search`,
-    {
-      method: "POST",
-      body: JSON.stringify({ limit: 10 }),
+interface LGMessage {
+  type: string;
+  content: string | Array<{ type: string; text: string }>;
+}
+
+interface LGRunResult {
+  messages?: LGMessage[];
+  metadata?: { run_id?: string };
+}
+
+function extractFinalText(result: LGRunResult): string {
+  const messages = result.messages ?? [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.type !== "ai") continue;
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n\n");
     }
-  );
-  if (!res.ok) {
-    logger.warn("resolveAssistantId search failed", { status: res.status });
-    return null;
   }
-
-  const list = (await res.json()) as Array<{
-    assistant_id: string;
-    name: string;
-    config?: { configurable?: { prompt_name?: string } };
-  }>;
-
-  // Match by exact name, or by configurable.prompt_name
-  const match = list.find(
-    (a) =>
-      a.name === agentName ||
-      a.config?.configurable?.prompt_name === agentName
-  );
-  return match?.assistant_id ?? null;
+  return "";
 }
 
-async function createThread(): Promise<string> {
-  const res = await lgFetch("/threads", { method: "POST", body: "{}" });
-  if (!res.ok) throw new Error(`createThread ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as { thread_id: string };
-  return data.thread_id;
-}
-
-async function streamRun(
-  threadId: string,
-  assistantId: string,
-  userMessage: string,
-  metadata?: Record<string, unknown>
-): Promise<string> {
-  const res = await lgFetch(`/threads/${threadId}/runs/stream`, {
-    method: "POST",
-    body: JSON.stringify({
-      assistant_id: assistantId,
-      input: { messages: [{ role: "human", content: userMessage }] },
-      stream_mode: ["values"],
-      config: { metadata: metadata ?? {} },
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`streamRun ${res.status}: ${await res.text()}`);
+async function resolveAssistantId(
+  nameOrId: string,
+): Promise<string | null> {
+  // UUID shape → pass through
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(nameOrId)) {
+    return nameOrId;
   }
-
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error("No response body from LangGraph stream");
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let lastAiContent = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const raw = line.slice(6).trim();
-      if (raw === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(raw) as {
-          messages?: Array<{
-            type: string;
-            content: string | Array<{ type: string; text?: string }>;
-          }>;
-        };
-        const messages = parsed?.messages;
-        if (Array.isArray(messages)) {
-          for (const msg of messages) {
-            if (msg.type === "ai" || msg.type === "assistant") {
-              if (typeof msg.content === "string") {
-                lastAiContent = msg.content;
-              } else if (Array.isArray(msg.content)) {
-                const text = msg.content
-                  .filter((b) => b.type === "text")
-                  .map((b) => b.text ?? "")
-                  .join("");
-                if (text) lastAiContent = text;
-              }
-            }
-          }
-        }
-      } catch {
-        // Non-JSON SSE line — skip
+  const base = env("LANGGRAPH_URL").replace(/\/$/, "");
+  const apiKey = env("LANGSMITH_API_KEY");
+  try {
+    const r = await fetch(`${base}/assistants/search`, {
+      method: "POST",
+      headers: { "x-api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 50 }),
+    });
+    if (!r.ok) return null;
+    const list = (await r.json()) as Array<{
+      assistant_id: string;
+      name?: string;
+      config?: { configurable?: { prompt_name?: string } };
+    }>;
+    const lower = nameOrId.toLowerCase();
+    for (const a of list) {
+      const promptName = a.config?.configurable?.prompt_name ?? "";
+      const name = a.name ?? "";
+      if (
+        a.assistant_id === nameOrId ||
+        promptName === nameOrId ||
+        promptName.toLowerCase() === lower ||
+        name === nameOrId ||
+        name.toLowerCase() === lower
+      ) {
+        return a.assistant_id;
       }
     }
+  } catch {
+    /* fall through */
   }
-
-  return lastAiContent;
+  return null;
 }
 
-// ── Supabase memory write ─────────────────────────────────────────────────────
+async function writeDispatchMemory(
+  payload: A2ADispatchPayload,
+  triggerRunId: string,
+  targetRunId: string | undefined,
+  threadId: string | undefined,
+  mode: "sync" | "async_downgrade",
+): Promise<string | undefined> {
+  const supaUrl = env("SUPABASE_URL").replace(/\/$/, "");
+  const key = env("SUPABASE_SERVICE_ROLE_KEY");
+  if (!key) return undefined;
+  // Fall back to default tenant if caller context didn't carry one (Studio
+  // test invocations, cron dispatches). Audit should never be silently
+  // skipped — better a default-tenant row than a death spot.
+  const tenantForAudit = payload.tenant_id || "00000000-0000-0000-0000-000000000001";
 
-async function writeDispatchMemory(opts: {
-  tenantId: string;
-  callerAgentId: string;
-  targetAgentId: string;
-  targetAgentName: string;
-  threadId: string;
-  correlationId: string;
-  message: string;
-  responseExcerpt: string;
-}): Promise<void> {
-  if (!opts.tenantId) return; // Never use a fake UUID
-  const url = `${env("SUPABASE_URL")}/rest/v1/rpc/memory_write_versioned`;
+  const body = {
+    p_agent_id: payload.caller_assistant_id ?? "_shared",
+    p_namespace: "shared/ongoing",
+    p_key: `dispatch-${triggerRunId.slice(0, 8)}`,
+    p_content: `A2A dispatch · ${payload.caller_assistant_id ?? "unknown"} → ${payload.target_agent} · mode=${mode} · msg="${payload.message.slice(0, 200)}"`,
+    p_memory_type: "dispatch",
+    p_confidence: 1.0,
+    p_source: "a2a-dispatch-sync",
+    p_tenant_id: tenantForAudit,
+    p_metadata: {
+      correlation_id: payload.correlation_id,
+      trigger_run_id: triggerRunId,
+      caller_run_id: payload.caller_run_id ?? null,
+      target_run_id: targetRunId ?? null,
+      target_thread_id: threadId ?? null,
+      target_agent: payload.target_agent,
+      mode,
+    },
+  };
   try {
-    const res = await fetch(url, {
+    const r = await fetch(`${supaUrl}/rest/v1/rpc/memory_write_versioned`, {
       method: "POST",
       headers: {
-        apikey: env("SUPABASE_SERVICE_ROLE_KEY"),
-        Authorization: `Bearer ${env("SUPABASE_SERVICE_ROLE_KEY")}`,
+        apikey: key,
+        Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        p_agent_id: opts.callerAgentId,
-        p_tenant_id: opts.tenantId,
-        p_namespace: "a2a_dispatches",
-        p_key: `sync:${opts.targetAgentName}:${opts.correlationId}`,
-        p_content: `[A2A sync dispatch to ${opts.targetAgentName}]\nMessage: ${opts.message.slice(0, 300)}\nResponse: ${opts.responseExcerpt.slice(0, 500)}`,
-        p_memory_type: "fact",
-        p_source: "system",
-        p_confidence: 1.0,
-        p_importance_score: 0.6,
-        p_metadata: {
-          target_agent_id: opts.targetAgentId,
-          target_agent_name: opts.targetAgentName,
-          thread_id: opts.threadId,
-          correlation_id: opts.correlationId,
-          transport: "trigger_sync",
-        },
-      }),
+      body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      logger.warn("writeDispatchMemory failed", { status: res.status });
-    }
-  } catch (err) {
-    logger.warn("writeDispatchMemory error (non-fatal)", { err });
+    if (!r.ok) return undefined;
+    const j = (await r.json()) as { id?: string };
+    return j?.id;
+  } catch {
+    return undefined;
   }
 }
-
-// ── Payload type ──────────────────────────────────────────────────────────────
-
-export type A2ADispatchSyncPayload = {
-  /** Target agent: name, prompt_name, or UUID */
-  agent_name: string;
-  /** Message to send to the target agent */
-  message: string;
-  /** Caller's assistant UUID (for audit) */
-  caller_assistant_id?: string;
-  /** Caller's thread UUID (for correlation) */
-  caller_thread_id?: string;
-  /** Caller's LangSmith run UUID (for correlation) */
-  caller_run_id?: string;
-  /** Shared correlation ID linking both sides of the call */
-  correlation_id?: string;
-  /** Tenant UUID for memory scoping — skips memory write if absent */
-  tenant_id?: string;
-  /** Intent token payload (forwarded verbatim to target) */
-  intent_token?: string;
-};
-
-// ── Task definition ───────────────────────────────────────────────────────────
 
 export const a2aDispatchSync = task({
   id: "a2a_dispatch_sync",
-  maxDuration: 600,
+  maxDuration: 600, // 10 min — still generous; long tools auto-downgrade to async
+  retry: { maxAttempts: 1 },
 
-  run: async (payload: A2ADispatchSyncPayload) => {
-    const {
-      agent_name,
-      message,
-      caller_assistant_id = "unknown",
-      caller_thread_id = null,
-      caller_run_id = "unknown",
-      correlation_id = crypto.randomUUID(),
-      tenant_id = "",
-      intent_token,
-    } = payload;
+  run: async (
+    payload: A2ADispatchPayload,
+    { ctx },
+  ): Promise<A2ADispatchSyncResult> => {
+    const triggerRunId = ctx?.run?.id ?? `fallback-${Date.now()}`;
 
-    logger.info("a2a_dispatch_sync started", { agent_name, correlation_id });
+    const emitDispatch = async (
+      event: "triggered" | "completed" | "failed",
+      extra: Record<string, unknown> = {},
+    ) => {
+      await appendDispatch({
+        event,
+        child_run_id: triggerRunId,
+        target_agent: payload.target_agent,
+        caller_agent: payload.caller_assistant_id ?? "unknown",
+        caller_thread_id: payload.caller_thread_id ?? null,
+        correlation_id: payload.correlation_id,
+        transport: "trigger_sync",
+        timestamp: new Date().toISOString(),
+        ...extra,
+      });
+    };
+    await emitDispatch("triggered");
 
-    // 1. Resolve target assistant UUID
-    const assistantId = await resolveAssistantId(agent_name);
-    if (!assistantId) {
-      throw new Error(
-        `Could not resolve assistant "${agent_name}". Check the name or UUID and ensure it is deployed.`
+    // Heuristic: long-task tools → auto-downgrade to async dispatch.
+    if (payload.hint_tool_type && LONG_TASK_TOOLS.has(payload.hint_tool_type)) {
+      const handle = await tasks.trigger("a2a_dispatch_async", payload, {
+        tags: payload.tenant_id ? [`tenant:${payload.tenant_id}`] : undefined,
+      });
+      const memoryId = await writeDispatchMemory(
+        payload,
+        triggerRunId,
+        undefined,
+        undefined,
+        "async_downgrade",
       );
+      return {
+        ok: true,
+        agent: payload.target_agent,
+        assistant_id: payload.assistant_id ?? "",
+        transport: "trigger_async_downgrade",
+        async_run_id: handle.id,
+        memory_id: memoryId,
+      };
     }
-    logger.info("Resolved assistant", { agent_name, assistantId });
 
-    // 2. Create a dedicated thread for this A2A call
-    const threadId = await createThread();
-    logger.info("Thread created", { threadId });
+    // Resolve assistant_id
+    const assistantId =
+      payload.assistant_id ?? (await resolveAssistantId(payload.target_agent));
+    if (!assistantId) {
+      return {
+        ok: false,
+        agent: payload.target_agent,
+        assistant_id: "",
+        transport: "trigger_sync",
+        error: `assistant '${payload.target_agent}' not found`,
+      };
+    }
 
-    // 3. Build the full message (prepend intent token if provided)
-    const fullMessage = intent_token
-      ? `[INTENT_TOKEN:${intent_token}]\n\n${message}`
-      : message;
+    // Create independent thread for the target
+    const lgBase = env("LANGGRAPH_URL").replace(/\/$/, "");
+    const apiKey = env("LANGSMITH_API_KEY");
+    const headers = { "x-api-key": apiKey, "Content-Type": "application/json" };
 
-    // 4. Stream the run
-    const metadata: Record<string, unknown> = {
-      a2a_caller_assistant_id: caller_assistant_id,
-      a2a_caller_thread_id: caller_thread_id,
-      a2a_caller_run_id: caller_run_id,
-      a2a_correlation_id: correlation_id,
-      tenant_id: tenant_id || undefined,
+    const threadResp = await fetch(`${lgBase}/threads`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        metadata: {
+          source: "a2a_dispatch_sync",
+          from: payload.caller_assistant_id ?? "unknown",
+          target: payload.target_agent,
+          trigger_run_id: triggerRunId,
+          correlation_id: payload.correlation_id,
+          parent_run_id: payload.caller_run_id ?? null,
+        },
+      }),
+    });
+    if (!threadResp.ok) {
+      return {
+        ok: false,
+        agent: payload.target_agent,
+        assistant_id: assistantId,
+        transport: "trigger_sync",
+        error: `thread create: ${threadResp.status} ${await threadResp.text()}`,
+      };
+    }
+    const { thread_id: threadId } = (await threadResp.json()) as {
+      thread_id: string;
     };
 
-    const response = await streamRun(threadId, assistantId, fullMessage, metadata);
+    try {
+      await tags.add([`thread:${threadId}`]);
+    } catch (err) {
+      console.warn(`tags.add target-thread failed (non-fatal): ${err}`);
+    }
 
-    logger.info("a2a_dispatch_sync completed", {
-      agent_name,
-      correlation_id,
-      thread_id: threadId,
-      response_length: response.length,
+    // Forward intent_token inline if present (target's verify_intent_node will strip + verify)
+    const outgoing = payload.intent_token
+      ? `<INTENT_TOKEN>${payload.intent_token}</INTENT_TOKEN>\n${payload.message}`
+      : payload.message;
+
+    const runCreateBody = {
+      assistant_id: assistantId,
+      input: { messages: [{ role: "human", content: outgoing }] },
+      config: {
+        configurable: {
+          tenant_id: payload.tenant_id ?? null,
+          actor_type: payload.actor_type ?? "agent",
+          actor_id: payload.caller_assistant_id ?? null,
+          source: "a2a_dispatch",
+          parent_trigger_run_id: triggerRunId,
+          parent_langsmith_run_id: payload.caller_run_id ?? null,
+          correlation_id: payload.correlation_id,
+          a2a_caller_assistant_id: payload.caller_assistant_id ?? null,
+          a2a_caller_run_id: payload.caller_run_id ?? null,
+          a2a_caller_thread_id: payload.caller_thread_id ?? null,
+        },
+        metadata: {
+          trigger_run_id: triggerRunId,
+          correlation_id: payload.correlation_id,
+          parent_run_id: payload.caller_run_id ?? null,
+          a2a_caller_assistant_id: payload.caller_assistant_id ?? null,
+        },
+      },
+    };
+
+    // Step 1: POST /runs — fire the run, grab real run_id immediately
+    const runCreateResp = await fetch(`${lgBase}/threads/${threadId}/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(runCreateBody),
     });
+    if (!runCreateResp.ok) {
+      return {
+        ok: false,
+        agent: payload.target_agent,
+        assistant_id: assistantId,
+        thread_id: threadId,
+        transport: "trigger_sync",
+        error: `runs create: ${runCreateResp.status} ${await runCreateResp.text()}`,
+      };
+    }
+    const runMeta = (await runCreateResp.json()) as { run_id?: string };
+    const targetRunId = runMeta.run_id;
+    if (!targetRunId) {
+      return {
+        ok: false,
+        agent: payload.target_agent,
+        assistant_id: assistantId,
+        thread_id: threadId,
+        transport: "trigger_sync",
+        error: "runs create returned no run_id",
+      };
+    }
 
-    // 5. Write audit memory entry
-    await writeDispatchMemory({
-      tenantId: tenant_id,
-      callerAgentId: caller_assistant_id,
-      targetAgentId: assistantId,
-      targetAgentName: agent_name,
+    // Step 2: /runs/{id}/join — wait for completion, get final state
+    const joinResp = await fetch(
+      `${lgBase}/threads/${threadId}/runs/${targetRunId}/join`,
+      { method: "GET", headers },
+    );
+    if (!joinResp.ok) {
+      return {
+        ok: false,
+        agent: payload.target_agent,
+        assistant_id: assistantId,
+        thread_id: threadId,
+        run_id: targetRunId,
+        transport: "trigger_sync",
+        error: `runs join: ${joinResp.status} ${await joinResp.text()}`,
+      };
+    }
+    const result = (await joinResp.json()) as LGRunResult;
+    const response = extractFinalText(result);
+
+    const memoryId = await writeDispatchMemory(
+      payload,
+      triggerRunId,
+      targetRunId,
       threadId,
-      correlationId: correlation_id,
-      message,
-      responseExcerpt: response,
+      "sync",
+    );
+
+    await emitDispatch("completed", {
+      target_thread_id: threadId,
+      output_excerpt: (response ?? "").slice(0, 200),
     });
 
     return {
       ok: true,
-      agent: agent_name,
+      agent: payload.target_agent,
       assistant_id: assistantId,
       thread_id: threadId,
-      run_id: null, // individual run ID not exposed by stream endpoint
-      response,
-      transport: "trigger_sync" as const,
-      correlation_id,
+      run_id: targetRunId,
+      response: response || "(target agent returned no text)",
+      transport: "trigger_sync",
+      memory_id: memoryId,
     };
   },
 });
