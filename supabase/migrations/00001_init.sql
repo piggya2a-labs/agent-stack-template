@@ -147,41 +147,38 @@ CREATE INDEX IF NOT EXISTS idx_system_state_tenant_id ON system_state(tenant_id)
 CREATE INDEX IF NOT EXISTS idx_system_state_category ON system_state(category);
 
 -- =============================================================================
--- TABLE 6: audit_logs
+-- TABLE 6: shared_contexts
 -- =============================================================================
+-- Stores shared knowledge, SOPs, team conventions, and other reference
+-- content that agents can look up at runtime.
 
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id    UUID REFERENCES tenants(id) ON DELETE SET NULL,
-  agent_id     TEXT,
-  action       TEXT NOT NULL,
-  status       TEXT NOT NULL DEFAULT 'success',
-  payload      JSONB NOT NULL DEFAULT '{}',
-  result       JSONB NOT NULL DEFAULT '{}',
-  error_msg    TEXT,
-  duration_ms  INT,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS shared_contexts (
+  context_key TEXT NOT NULL,
+  tenant_id   UUID REFERENCES tenants(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  -- scope: tenant (visible to one tenant) | global (visible to all)
+  scope       TEXT NOT NULL DEFAULT 'tenant',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (context_key, tenant_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_id ON audit_logs(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_agent_id ON audit_logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_status ON audit_logs(status);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shared_contexts_tenant_id ON shared_contexts(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_shared_contexts_scope ON shared_contexts(scope);
 
 -- =============================================================================
 -- RLS (Row-Level Security) — enable and configure for all tables
 -- =============================================================================
 
-ALTER TABLE tenants       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE projects      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE agent_memory  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tool_registry ENABLE ROW LEVEL SECURITY;
-ALTER TABLE system_state  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenants         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_memory    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tool_registry   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE system_state    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shared_contexts ENABLE ROW LEVEL SECURITY;
 
--- Service role bypass: the service_role key (used by backend tasks) can read/write everything
--- These policies are intentionally permissive for the service role.
+-- Service role bypass: the service_role key (used by backend tasks) can read/write everything.
 -- Add user-scoped policies if you expose data directly to end users via the anon/authenticated key.
 
 CREATE POLICY "service_role_all_tenants"
@@ -199,8 +196,8 @@ CREATE POLICY "service_role_all_tool_registry"
 CREATE POLICY "service_role_all_system_state"
   ON system_state FOR ALL TO service_role USING (true) WITH CHECK (true);
 
-CREATE POLICY "service_role_all_audit_logs"
-  ON audit_logs FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY "service_role_all_shared_contexts"
+  ON shared_contexts FOR ALL TO service_role USING (true) WITH CHECK (true);
 
 -- =============================================================================
 -- RPC: memory_write_versioned
@@ -292,7 +289,6 @@ BEGIN
 END;
 $$;
 
--- Grant execute to service_role
 GRANT EXECUTE ON FUNCTION memory_write_versioned TO service_role;
 
 -- =============================================================================
@@ -388,10 +384,9 @@ WHERE p.status = 'ready';
 -- =============================================================================
 -- Done!
 -- =============================================================================
--- Summary of what was created:
---   Tables : tenants, projects, agent_memory, tool_registry, system_state, audit_logs
---   Indexes: 20+ covering foreign keys, frequent filter columns, vector search
---   RLS    : enabled on all tables with service_role bypass policies
---   RPCs   : memory_write_versioned, memory_search_semantic
---   Views  : active_projects
+-- Tables  : tenants, projects, agent_memory, tool_registry, system_state, shared_contexts
+-- Indexes : 15+ covering foreign keys, frequent filter columns, vector search
+-- RLS     : enabled on all tables with service_role bypass policies
+-- RPCs    : memory_write_versioned, memory_search_semantic
+-- Views   : active_projects
 -- =============================================================================
