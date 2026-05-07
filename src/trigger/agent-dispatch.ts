@@ -1,271 +1,389 @@
 /**
- * src/trigger/agent-dispatch.ts
+ * agent-dispatch.ts — Trigger.dev Orchestrator Task
  *
- * GitHub Issue [TASK] → LangGraph Cloud router.
+ * Triggered by github-webhook when a [TASK] issue is opened.
+ * Routes to the repo's registered project assistant.
  *
- * Triggered by a webhook (or any caller) with payload:
- *   { task, issue_number, repo_full_name, tenant_id? }
+ * Payload: { task, issue_number, tenant_id, installation_id, repo_full_name }
  *
- * Flow:
- *   1. Look up the assistant UUID in the `projects` table via Supabase REST
- *   2. Create a new LangGraph thread
- *   3. Stream a run on that thread with the task as user message
- *   4. Extract the final text response
- *   5. Post a comment on the GitHub Issue
- *   6. Write a memory entry (if tenant_id is known)
+ * Required env vars:
+ *   SUPABASE_URL               — your Supabase project URL
+ *   SUPABASE_SERVICE_ROLE_KEY  — Supabase service role key
+ *   LANGGRAPH_URL              — your LangGraph Cloud deployment URL
+ *   LANGSMITH_API_KEY          — LangSmith API key
+ *   GITHUB_TOKEN               — GitHub PAT (Issues read/write)
  */
 
-import { task, logger } from "@trigger.dev/sdk";
-import { getGitHubHeaders } from "./github-auth.js";
+import { task, wait } from "@trigger.dev/sdk";
+import { getInstallationToken } from "./github-auth";
 
-// ── env helper ────────────────────────────────────────────────────────────────
+// ── Environment helpers ───────────────────────────────────────────────────────
 
-function env(name: string): string {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing required environment variable: ${name}`);
-  return val;
+function env(name: string, fallback = ""): string {
+  return process.env[name] ?? fallback;
 }
 
-// ── Supabase thin client ──────────────────────────────────────────────────────
-
-async function supabaseFetch(
-  path: string,
-  init: RequestInit = {}
-): Promise<unknown> {
-  const url = `${env("SUPABASE_URL")}/rest/v1${path}`;
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      apikey: env("SUPABASE_SERVICE_ROLE_KEY"),
-      Authorization: `Bearer ${env("SUPABASE_SERVICE_ROLE_KEY")}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-      ...(init.headers as Record<string, string> | undefined),
-    },
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Supabase ${res.status}: ${text}`);
-  return text ? JSON.parse(text) : null;
+function supabaseHeaders(): Record<string, string> {
+  const key = env("SUPABASE_SERVICE_ROLE_KEY");
+  return {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+  };
 }
 
-// ── LangGraph helpers ─────────────────────────────────────────────────────────
-
-async function lgFetch(
-  path: string,
-  init: RequestInit = {}
-): Promise<Response> {
-  const base = env("LANGGRAPH_URL").replace(/\/$/, "");
-  return fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      "x-api-key": env("LANGSMITH_API_KEY"),
-      "Content-Type": "application/json",
-      ...(init.headers as Record<string, string> | undefined),
-    },
-  });
+// Look up a user's project by repo — returns assistant info if found.
+async function lookupProjectByRepo(
+  tenantId: string,
+  repoFullName: string,
+): Promise<{ assistantId: string; langgraphUrl: string } | null> {
+  const url = env("SUPABASE_URL");
+  const motherUrl = env("LANGGRAPH_URL");
+  const resp = await fetch(
+    `${url}/rest/v1/projects?tenant_id=eq.${tenantId}&repo_full_name=eq.${encodeURIComponent(repoFullName)}&status=eq.ready&select=langgraph_assistant_id&limit=1`,
+    { headers: supabaseHeaders() },
+  );
+  if (!resp.ok) {
+    console.warn(
+      `lookupProjectByRepo: Supabase error ${resp.status} for ${repoFullName}`,
+    );
+    return null;
+  }
+  const rows = (await resp.json()) as Array<{ langgraph_assistant_id: string | null }>;
+  const assistantId = rows[0]?.langgraph_assistant_id;
+  if (!assistantId) return null;
+  return { assistantId, langgraphUrl: motherUrl };
 }
 
-async function createThread(): Promise<string> {
-  const res = await lgFetch("/threads", { method: "POST", body: "{}" });
-  if (!res.ok) throw new Error(`createThread ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as { thread_id: string };
-  return data.thread_id;
+// ── LangGraph API ─────────────────────────────────────────────────────────────
+
+interface LangGraphRunResult {
+  threadId: string;
+  runId: string;
+  output: string;
+  calledCopilotIssue: boolean;
 }
 
-async function streamRun(
-  threadId: string,
+async function callLangGraphAssistant(
   assistantId: string,
-  userMessage: string
-): Promise<string> {
-  const res = await lgFetch(`/threads/${threadId}/runs/stream`, {
+  langgraphUrl: string,
+  taskText: string,
+  tenantId: string,
+  installationId: number,
+): Promise<LangGraphRunResult> {
+  const apiKey = env("LANGSMITH_API_KEY");
+  const baseUrl = langgraphUrl.replace(/\/$/, "");
+
+  const headers: Record<string, string> = {
+    "x-api-key": apiKey,
+    "Content-Type": "application/json",
+  };
+
+  const threadResp = await fetch(`${baseUrl}/threads`, {
     method: "POST",
+    headers,
+    body: JSON.stringify({}),
+  });
+  if (!threadResp.ok) {
+    throw new Error(`LangGraph /threads failed: ${threadResp.status} ${await threadResp.text()}`);
+  }
+  const { thread_id: threadId } = (await threadResp.json()) as { thread_id: string };
+
+  const runResp = await fetch(`${baseUrl}/threads/${threadId}/runs/wait`, {
+    method: "POST",
+    headers,
     body: JSON.stringify({
       assistant_id: assistantId,
-      input: { messages: [{ role: "human", content: userMessage }] },
-      stream_mode: ["values"],
+      input: {
+        messages: [{ role: "human", content: taskText }],
+      },
+      config: {
+        configurable: {
+          tenant_id: tenantId,
+          installation_id: String(installationId),
+          actor_type: "system",
+          actor_id: "agent-dispatch",
+          source: "github_task_issue",
+        },
+      },
     }),
   });
 
-  if (!res.ok) {
-    throw new Error(`streamRun ${res.status}: ${await res.text()}`);
+  if (!runResp.ok) {
+    throw new Error(`LangGraph /runs/wait failed: ${runResp.status} ${await runResp.text()}`);
   }
 
-  // Parse SSE stream and capture the last AI message content
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error("No response body from LangGraph stream");
+  const result = (await runResp.json()) as {
+    messages?: Array<{
+      type: string;
+      content: string | Array<{ type: string; text: string }>;
+      tool_calls?: Array<{ name: string }>;
+    }>;
+    metadata?: { run_id?: string };
+  };
 
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let lastAiContent = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const raw = line.slice(6).trim();
-      if (raw === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(raw) as {
-          messages?: Array<{ type: string; content: string | Array<{type: string; text?: string}> }>;
-        };
-        const messages = parsed?.messages;
-        if (Array.isArray(messages)) {
-          for (const msg of messages) {
-            if (msg.type === "ai" || msg.type === "assistant") {
-              if (typeof msg.content === "string") {
-                lastAiContent = msg.content;
-              } else if (Array.isArray(msg.content)) {
-                // Handle structured content blocks
-                const text = msg.content
-                  .filter((b) => b.type === "text")
-                  .map((b) => b.text ?? "")
-                  .join("");
-                if (text) lastAiContent = text;
-              }
-            }
-          }
-        }
-      } catch {
-        // Non-JSON SSE lines (comments, etc.) — skip
+  const messages = result.messages ?? [];
+  let output = JSON.stringify(result);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].type === "ai") {
+      const content = messages[i].content;
+      if (typeof content === "string") {
+        output = content;
+      } else if (Array.isArray(content)) {
+        output = content.filter(b => b.type === "text").map(b => b.text).join("\n\n") || output;
       }
+      break;
     }
   }
 
-  return lastAiContent;
+  const calledCopilotIssue = messages.some(
+    m => m.type === "ai" &&
+      Array.isArray(m.tool_calls) &&
+      m.tool_calls.some(tc => tc.name === "create_copilot_issue")
+  );
+
+  const runId = result.metadata?.run_id ?? threadId;
+  return { threadId, runId, output, calledCopilotIssue };
 }
 
-// ── GitHub Issue comment ──────────────────────────────────────────────────────
+// ── GitHub helpers ────────────────────────────────────────────────────────────
 
-async function postIssueComment(
+async function githubHeaders(installationId: number): Promise<Record<string, string>> {
+  try {
+    const token = await getInstallationToken(installationId);
+    return {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+    };
+  } catch (e) {
+    console.warn(`Installation token failed, falling back to PAT: ${e}`);
+    const pat = env("GITHUB_TOKEN", "");
+    return {
+      Authorization: `Bearer ${pat}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+    };
+  }
+}
+
+async function postGitHubCommentIdempotent(
   repoFullName: string,
   issueNumber: number,
-  body: string
+  body: string,
+  idempotencyKey: string,
+  installationId: number,
 ): Promise<void> {
-  const [owner, repo] = repoFullName.split("/");
-  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: getGitHubHeaders(),
-    body: JSON.stringify({ body }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`postIssueComment ${res.status}: ${text}`);
-  }
-}
+  const headers = await githubHeaders(installationId);
+  const marker = `<!-- idem:${idempotencyKey} -->`;
+  const bodyWithMarker = `${body}\n\n${marker}`;
 
-// ── Memory write ──────────────────────────────────────────────────────────────
-
-async function writeMemory(
-  tenantId: string,
-  agentId: string,
-  key: string,
-  content: string
-): Promise<void> {
-  // Skips silently if tenant_id is empty — never uses a fake/hardcoded UUID
-  if (!tenantId) return;
   try {
-    await supabaseFetch("/rpc/memory_write_versioned", {
+    const listResp = await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/comments?per_page=100`,
+      { headers }
+    );
+    if (listResp.ok) {
+      const comments = (await listResp.json()) as Array<{ body: string }>;
+      if (comments.some(c => c.body?.includes(marker))) return;
+    }
+  } catch { /* proceed */ }
+
+  await fetch(
+    `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/comments`,
+    {
       method: "POST",
-      body: JSON.stringify({
-        p_agent_id: agentId,
-        p_tenant_id: tenantId,
-        p_namespace: "agent_dispatch",
-        p_key: key,
-        p_content: content,
-        p_memory_type: "fact",
-        p_source: "system",
-        p_confidence: 0.9,
-        p_importance_score: 0.5,
-      }),
-    });
-  } catch (err) {
-    // Non-fatal — memory write failures never block the main flow
-    logger.warn("Memory write failed (non-fatal)", { err });
+      headers,
+      body: JSON.stringify({ body: bodyWithMarker }),
+    }
+  );
+}
+
+async function checkIssueHasLabel(
+  repoFullName: string,
+  issueNumber: number,
+  labelName: string,
+  installationId: number,
+): Promise<boolean> {
+  const headers = await githubHeaders(installationId);
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/labels`,
+      { headers }
+    );
+    if (!resp.ok) return false;
+    const labels = (await resp.json()) as Array<{ name: string }>;
+    return labels.some(l => l.name === labelName);
+  } catch { return false; }
+}
+
+async function assignCopilotToIssue(
+  repoFullName: string,
+  issueNumber: number,
+  installationId: number,
+): Promise<void> {
+  const headers = await githubHeaders(installationId);
+  try {
+    await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/assignees`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ assignees: ["copilot-swe-agent[bot]"] }),
+      }
+    );
+  } catch (e) {
+    console.warn(`Copilot assign failed: ${e}`);
   }
 }
 
-// ── Payload type ──────────────────────────────────────────────────────────────
+// ── Trigger.dev Task ──────────────────────────────────────────────────────────
 
-export type AgentDispatchPayload = {
-  /** The task text (Issue title or body excerpt) */
+export interface AgentDispatchPayload {
   task: string;
-  /** GitHub Issue number */
   issue_number: number;
-  /** Full repo name, e.g. "my-org/my-repo" */
+  tenant_id: string;
+  installation_id: number;
   repo_full_name: string;
-  /** Optional tenant UUID for memory scoping */
-  tenant_id?: string;
-};
-
-// ── Task definition ───────────────────────────────────────────────────────────
+}
 
 export const agentDispatch = task({
   id: "agent-dispatch",
-  maxDuration: 300,
+  retry: { maxAttempts: 3 },
 
-  run: async (payload: AgentDispatchPayload) => {
-    const { task: taskText, issue_number, repo_full_name, tenant_id } = payload;
+  async run(payload: AgentDispatchPayload, { ctx }) {
+    const {
+      task: taskText,
+      issue_number: issueNumber,
+      tenant_id: tenantId,
+      installation_id: installationId,
+      repo_full_name: repoFullName,
+    } = payload;
 
-    logger.info("agent-dispatch started", { repo_full_name, issue_number });
+    const runPrefix = ctx?.run?.id ?? `fallback-${issueNumber}-${Date.now()}`;
 
-    // 1. Look up the LangGraph assistant for this repo
-    const rows = (await supabaseFetch(
-      `/projects?repo_full_name=eq.${encodeURIComponent(repo_full_name)}&status=eq.ready&select=langgraph_assistant_id,name,tenant_id&limit=1`
-    )) as Array<{ langgraph_assistant_id: string; name: string; tenant_id: string }>;
+    // ── Copilot direct-assign branch ──────────────────────────────────────
+    const isCopilotTask = await checkIssueHasLabel(repoFullName, issueNumber, "copilot-task", installationId);
+    if (isCopilotTask) {
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        `🤖 **Copilot direct mode**: detected \`copilot-task\` label, assigning to GitHub Copilot...`,
+        `${runPrefix}:copilot-assign`, installationId
+      );
 
-    if (!rows || rows.length === 0) {
-      const msg = `No active project found for repo \`${repo_full_name}\`. Please register it in the \`projects\` table.`;
-      logger.warn("No project assistant found", { repo_full_name });
-      await postIssueComment(repo_full_name, issue_number, msg);
-      return { ok: false, reason: "no_project" };
+      await assignCopilotToIssue(repoFullName, issueNumber, installationId);
+
+      const token = await wait.createToken();
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        [
+          "## ⏳ Waiting for Copilot",
+          "",
+          "Copilot has been assigned. Waiting for PR to be submitted and merged.",
+          "",
+          `*[Webhook URL](${token.url})*`,
+          `*tenant: \`${tenantId}\` · agent-gateway*`,
+        ].join("\n"),
+        `${runPrefix}:copilot-wait`, installationId
+      );
+
+      const waitPayload = await wait.forToken(token);
+
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        "## ✅ Copilot task complete\n\nPR merged — task loop closed.",
+        `${runPrefix}:copilot-done`, installationId
+      );
+
+      return { ok: true, assignee: "copilot-swe-agent", tenantId, waitPayload };
     }
 
-    const { langgraph_assistant_id: assistantId, name: projectName, tenant_id: projectTenantId } = rows[0];
-    // Prefer the explicit tenant_id from the payload; fall back to the one stored on the project
-    const effectiveTenantId = tenant_id ?? projectTenantId ?? "";
-
-    logger.info("Routing to assistant", { assistantId, projectName });
-
-    // 2. Create a new LangGraph thread
-    const threadId = await createThread();
-    logger.info("Thread created", { threadId });
-
-    // 3. Stream the run
-    const agentResponse = await streamRun(threadId, assistantId, taskText);
-
-    if (!agentResponse) {
-      const msg = `Agent ran but returned an empty response. Check the LangGraph deployment logs for thread \`${threadId}\`.`;
-      await postIssueComment(repo_full_name, issue_number, msg);
-      return { ok: false, reason: "empty_response", thread_id: threadId };
+    // ── Normal LangGraph routing branch ───────────────────────────────────
+    const project = await lookupProjectByRepo(tenantId, repoFullName);
+    if (!project) {
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        [
+          "## ⚠️ No project assistant found",
+          "",
+          `Repo \`${repoFullName}\` has no registered LangGraph assistant in the \`projects\` table.`,
+          "Please bind a \`langgraph_assistant_id\` via the setup guide and re-open this issue.",
+        ].join("\n"),
+        `${runPrefix}:no-project`, installationId
+      );
+      return { ok: false, reason: "no_project_assistant", tenantId };
     }
 
-    logger.info("Agent response received", { chars: agentResponse.length });
-
-    // 4. Post result as GitHub Issue comment
-    await postIssueComment(repo_full_name, issue_number, agentResponse);
-
-    // 5. Write memory entry (skips if no tenant)
-    await writeMemory(
-      effectiveTenantId,
-      assistantId,
-      `dispatch:${repo_full_name}:${issue_number}`,
-      `Task: ${taskText}\n\nResponse excerpt: ${agentResponse.slice(0, 500)}`
+    await postGitHubCommentIdempotent(
+      repoFullName, issueNumber,
+      `⚙️ **Running...**`,
+      `${runPrefix}:executing`, installationId
     );
 
-    logger.info("agent-dispatch completed", { issue_number, thread_id: threadId });
+    let lgResult: LangGraphRunResult;
+    try {
+      lgResult = await callLangGraphAssistant(
+        project.assistantId,
+        project.langgraphUrl,
+        taskText,
+        tenantId,
+        installationId,
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        `## ❌ Task failed\n\n\`\`\`\n${errMsg}\n\`\`\`\n\n*tenant: \`${tenantId}\` · agent-gateway*`,
+        `${runPrefix}:error`, installationId
+      );
+      throw err;
+    }
+    const { threadId, runId, output, calledCopilotIssue } = lgResult;
 
-    return {
-      ok: true,
-      thread_id: threadId,
-      assistant_id: assistantId,
-      response_length: agentResponse.length,
-    };
+    if (calledCopilotIssue) {
+      const token = await wait.createToken();
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        [
+          "## ⏳ Task paused — waiting for external action",
+          "",
+          `**Assistant**: \`${project.assistantId}\``,
+          "",
+          output,
+          "",
+          `*[Webhook URL](${token.url})*`,
+          `*\`run_id\`: \`${runId}\` · tenant: \`${tenantId}\` · agent-gateway*`,
+        ].join("\n"),
+        `${runPrefix}:wait`, installationId
+      );
+
+      const waitPayload = await wait.forToken(token);
+
+      await postGitHubCommentIdempotent(
+        repoFullName, issueNumber,
+        "## ✅ Task resumed and complete\n\nPR merged — task loop closed.",
+        `${runPrefix}:resume`, installationId
+      );
+
+      return { ok: true, assistantId: project.assistantId, runId, threadId, tenantId, waitPayload };
+    }
+
+    await postGitHubCommentIdempotent(
+      repoFullName, issueNumber,
+      [
+        "## ✅ Task complete",
+        "",
+        `**Assistant**: \`${project.assistantId}\``,
+        "",
+        output,
+        "",
+        `*\`run_id\`: \`${runId}\` · tenant: \`${tenantId}\` · agent-gateway*`,
+      ].join("\n"),
+      `${runPrefix}:result`, installationId
+    );
+
+    return { ok: true, assistantId: project.assistantId, runId, threadId, tenantId };
   },
 });
