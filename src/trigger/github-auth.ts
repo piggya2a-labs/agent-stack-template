@@ -1,13 +1,17 @@
 /**
- * github-auth.ts — GitHub authentication helper.
- * Uses a Personal Access Token (PAT) from GITHUB_TOKEN env var.
+ * github-auth.ts — GitHub authentication helper for Trigger.dev tasks.
+ *
+ * Uses a Personal Access Token (PAT) stored in GITHUB_TOKEN env var.
+ * For multi-tenant GitHub App auth, replace with your own App credentials.
+ *
+ * Environment variables required:
+ *   GITHUB_TOKEN — Personal Access Token with Issues (read/write) permission
  */
-export function getGitHubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? "";
-  return {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "Content-Type": "application/json",
-  };
+
+export async function getInstallationToken(_installationId: number | string): Promise<string> {
+  // Template version: uses a single PAT instead of GitHub App installation tokens.
+  // To use GitHub App auth, implement JWT generation and exchange here.
+  const pat = process.env["GITHUB_TOKEN"] ?? "";
+  if (!pat) throw new Error("GITHUB_TOKEN is not set");
+  return pat;
 }
